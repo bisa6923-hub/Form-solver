@@ -33,7 +33,21 @@ class MainActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        val crashPrefs = getSharedPreferences("crash", Context.MODE_PRIVATE)
+        val lastCrash = crashPrefs.getString("log", null)
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            crashPrefs.edit().putString("log", android.util.Log.getStackTraceString(e)).commit()
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }
+        if (lastCrash != null) {
+            crashPrefs.edit().remove("log").apply()
+            val tv = TextView(this)
+            tv.text = lastCrash
+            tv.textSize = 11f
+            tv.setTextIsSelectable(true)
+            setContentView(android.widget.ScrollView(this).apply { addView(tv) })
+            return
+        }
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val top = LinearLayout(this).apply {

@@ -5,7 +5,8 @@
 
     <application
         android:allowBackup="false"
-        android:label="Form Solver"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Sanadoy Solver"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
         <activity
             android:name=".MainActivity"

@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.Context
 import android.os.Bundle
 import android.text.InputType
+import android.util.Base64
 import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
 import android.webkit.WebView
@@ -33,21 +34,7 @@ class MainActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val crashPrefs = getSharedPreferences("crash", Context.MODE_PRIVATE)
-        val lastCrash = crashPrefs.getString("log", null)
-        Thread.setDefaultUncaughtExceptionHandler { _, e ->
-            crashPrefs.edit().putString("log", android.util.Log.getStackTraceString(e)).commit()
-            android.os.Process.killProcess(android.os.Process.myPid())
-        }
-        if (lastCrash != null) {
-            crashPrefs.edit().remove("log").apply()
-            val tv = TextView(this)
-            tv.text = lastCrash
-            tv.textSize = 11f
-            tv.setTextIsSelectable(true)
-            setContentView(android.widget.ScrollView(this).apply { addView(tv) })
-            return
-        }
+
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val top = LinearLayout(this).apply {
@@ -120,7 +107,7 @@ class MainActivity : Activity() {
             isSingleLine = true
         }
         val model = EditText(this).apply {
-            hint = "Model (default: gemini-2.5-flash)"
+            hint = "Model (default: gemini-flash-latest)"
             setText(prefs.getString("model", ""))
             isSingleLine = true
         }
@@ -142,7 +129,7 @@ class MainActivity : Activity() {
 
     private fun solve() {
         val key = prefs.getString("key", "") ?: ""
-        val model = (prefs.getString("model", "") ?: "").ifBlank { "gemini-2.5-flash" }
+        val model = (prefs.getString("model", "") ?: "").ifBlank { "gemini-flash-latest" }
         if (key.isBlank()) {
             setStatus("Isi API key dulu di Pengaturan.")
             showSettings()
@@ -159,15 +146,23 @@ class MainActivity : Activity() {
                 setStatus("Soal tidak ditemukan. Buka halaman form (viewform) dulu.")
                 return@evaluateJavascript
             }
-            val count = JSONArray(json).length()
-            setStatus("Meminta jawaban AI untuk $count soal...")
+            val all = JSONArray(json)
             thread {
                 try {
-                    val answers = callGemini(json, key, model)
-                    runOnUiThread {
-                        web.evaluateJavascript("window.__fill(" + JSONObject.quote(answers) + ");", null)
-                        status.text = "Jawaban diisi. Periksa dulu sebelum kirim."
+                    val total = all.length()
+                    var i = 0
+                    while (i < total) {
+                        val end = minOf(i + CHUNK, total)
+                        val chunk = JSONArray()
+                        for (j in i until end) chunk.put(all.getJSONObject(j))
+                        setStatus("AI mengerjakan soal " + (i + 1) + "-" + end + " dari " + total + "...")
+                        val answers = callGemini(chunk, key, model)
+                        runOnUiThread {
+                            web.evaluateJavascript("window.__fill(" + JSONObject.quote(answers) + ");", null)
+                        }
+                        i = end
                     }
+                    setStatus("Selesai. Periksa jawaban sebelum kirim.")
                 } catch (e: Exception) {
                     setStatus("Error: " + e.message)
                 }
@@ -175,38 +170,114 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun callGemini(questions: String, key: String, model: String): String {
+    private fun downloadImage(url: String): JSONObject? {
+        try {
+            val c = URL(url).openConnection() as HttpURLConnection
+            c.connectTimeout = 15000
+            c.readTimeout = 30000
+            c.setRequestProperty("User-Agent", "Mozilla/5.0")
+            if (c.responseCode !in 200..299) return null
+            val mime = (c.contentType ?: "").substringBefore(";").trim()
+            if (!mime.startsWith("image/")) return null
+            val bytes = c.inputStream.use { it.readBytes() }
+            if (bytes.isEmpty() || bytes.size > 6000000) return null
+            return JSONObject().put(
+                "inline_data",
+                JSONObject().put("mime_type", mime).put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
+            )
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    private fun callGemini(chunk: JSONArray, key: String, model: String): String {
+        val imageParts = ArrayList<Pair<String, JSONObject>>()
+        val clean = JSONArray()
+        for (k in 0 until chunk.length()) {
+            val q = JSONObject(chunk.getJSONObject(k).toString())
+            val id = q.getInt("id")
+            val qi = q.optJSONArray("images")
+            val oi = q.optJSONArray("optionImages")
+            q.remove("images")
+            q.remove("optionImages")
+            if (qi != null) {
+                for (n in 0 until qi.length()) {
+                    if (imageParts.size >= MAX_IMG) break
+                    val part = downloadImage(qi.getString(n)) ?: continue
+                    imageParts.add(Pair("Gambar pada soal id $id (nomor ${n + 1}):", part))
+                }
+            }
+            if (oi != null) {
+                for (n in 0 until oi.length()) {
+                    val u = oi.optString(n, "")
+                    if (u.isEmpty() || imageParts.size >= MAX_IMG) continue
+                    val part = downloadImage(u) ?: continue
+                    imageParts.add(Pair("Gambar pilihan ke-${n + 1} pada soal id $id:", part))
+                }
+            }
+            clean.put(q)
+        }
+        setStatus("Mengirim " + chunk.length() + " soal + " + imageParts.size + " gambar ke AI...")
+
+        val parts = JSONArray()
+        parts.put(
+            JSONObject().put(
+                "text",
+                "Soal (JSON). Gambar terlampir setelah ini, tiap gambar didahului labelnya:\n" + clean.toString()
+            )
+        )
+        for ((label, part) in imageParts) {
+            parts.put(JSONObject().put("text", label))
+            parts.put(part)
+        }
+
         val body = JSONObject()
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
             .put(
-                "contents", JSONArray().put(
-                    JSONObject().put("role", "user")
-                        .put("parts", JSONArray().put(JSONObject().put("text", questions)))
-                )
+                "generationConfig",
+                JSONObject().put("responseMimeType", "application/json").put("temperature", 0.2)
             )
-            .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+        val payload = body.toString().toByteArray(Charsets.UTF_8)
 
-        val conn = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model.trim() + ":generateContent")
-            .openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.connectTimeout = 20000
-        conn.readTimeout = 90000
-        conn.doOutput = true
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.setRequestProperty("x-goog-api-key", key)
-        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        var lastErr = ""
+        for (attempt in 1..4) {
+            val conn = URL(
+                "https://generativelanguage.googleapis.com/v1beta/models/" + model.trim() + ":generateContent"
+            ).openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 20000
+            conn.readTimeout = 120000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("x-goog-api-key", key)
+            conn.outputStream.use { it.write(payload) }
 
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val text = stream.bufferedReader().use { it.readText() }
-        if (code !in 200..299) throw Exception("API $code: " + text.take(200))
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream.bufferedReader().use { it.readText() }
 
-        val out = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-        val s = out.indexOf('[')
-        val e = out.lastIndexOf(']')
-        if (s < 0 || e < 0) throw Exception("Balasan AI tidak valid")
-        return out.substring(s, e + 1)
+            if (code in 200..299) {
+                val cands = JSONObject(text).optJSONArray("candidates")
+                if (cands == null || cands.length() == 0) throw Exception("AI tidak memberi jawaban (mungkin diblokir).")
+                val ps = cands.getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+                val sb = StringBuilder()
+                for (n in 0 until ps.length()) sb.append(ps.getJSONObject(n).optString("text", ""))
+                val out = sb.toString()
+                val s = out.indexOf('[')
+                val e = out.lastIndexOf(']')
+                if (s < 0 || e < 0) throw Exception("Balasan AI tidak valid")
+                return out.substring(s, e + 1)
+            }
+            lastErr = "API " + code + ": " + text.take(150)
+            if (code == 429 || code >= 500) {
+                setStatus("Server sibuk, mencoba ulang ($attempt/4)...")
+                Thread.sleep(4000L * attempt)
+                continue
+            }
+            throw Exception(lastErr)
+        }
+        throw Exception(lastErr)
     }
 
     @Deprecated("Deprecated in Java")
@@ -215,12 +286,19 @@ class MainActivity : Activity() {
     }
 
     companion object {
-        const val SYSTEM = "Kamu membantu mengisi formulir. Kamu menerima array JSON soal dengan field: " +
+        const val CHUNK = 5
+        const val MAX_IMG = 16
+
+        const val SYSTEM = "Kamu guru yang teliti sekaligus pengisi formulir. Kamu menerima array JSON soal dengan field: " +
             "id, type (radio | checkbox | dropdown | text), question, options (untuk radio/checkbox/dropdown). " +
-            "Balas HANYA dengan array JSON tanpa teks lain. Format: [{\"id\": 0, \"answer\": ...}]. " +
-            "Aturan: radio/dropdown: answer = SATU string yang persis sama dengan salah satu options. " +
-            "checkbox: answer = array string, tiap item persis sama dengan salah satu options. " +
-            "text: answer = string jawaban singkat dan langsung. " +
+            "Gambar yang berkaitan dengan soal atau pilihan dilampirkan setelah JSON dan diberi label. " +
+            "Baca gambar (tabel, grafik, diagram) dengan teliti sebelum menjawab. " +
+            "Kerjakan tiap soal dengan hati-hati, hitung langkah demi langkah. " +
+            "Balas HANYA dengan array JSON: [{\"id\": 0, \"reasoning\": \"langkah singkat\", \"answer\": ...}]. " +
+            "Tulis reasoning SEBELUM answer. " +
+            "Aturan answer: radio/dropdown: SATU string yang persis sama dengan salah satu options. " +
+            "checkbox: array string, tiap item persis sama dengan salah satu options. " +
+            "text: string jawaban singkat dan langsung. " +
             "Jika tidak yakin, tetap pilih jawaban paling mungkin benar."
 
         val JS_LIB = """
@@ -232,6 +310,31 @@ class MainActivity : Activity() {
   var all = function(el, sel){ return Array.prototype.slice.call(el.querySelectorAll(sel)); };
   var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
 
+  var optBox = function(r, el, sel){
+    var c = r;
+    while (c.parentElement && c.parentElement !== el && c.parentElement.querySelectorAll(sel).length === 1) c = c.parentElement;
+    return c;
+  };
+  var imgOf = function(im){
+    var w = im.naturalWidth || im.width || 0;
+    if (w && w < 50) return '';
+    var s = im.currentSrc || im.src || '';
+    return /^https?:/.test(s) ? s : '';
+  };
+  var imgUrl = function(box){
+    var im = box.querySelector('img');
+    return im ? imgOf(im) : '';
+  };
+  var qImgs = function(el, boxes){
+    var out = [];
+    all(el, 'img').forEach(function(im){
+      for (var i=0;i<boxes.length;i++) if (boxes[i].contains(im)) return;
+      var s = imgOf(im);
+      if (s && out.indexOf(s) < 0) out.push(s);
+    });
+    return out;
+  };
+
   window.__extract = function(){
     var out = [];
     items().forEach(function(el, id){
@@ -242,11 +345,22 @@ class MainActivity : Activity() {
       var checks = all(el, 'div[role="checkbox"]');
       var listbox = el.querySelector('div[role="listbox"]');
       var text = el.querySelector('input[type="text"], textarea');
-      if (radios.length) out.push({id:id, type:'radio', question:question, options:radios.map(lab)});
-      else if (checks.length) out.push({id:id, type:'checkbox', question:question, options:checks.map(lab)});
-      else if (listbox) out.push({id:id, type:'dropdown', question:question,
-        options: all(listbox, 'div[role="option"]').map(lab).filter(Boolean)});
-      else if (text) out.push({id:id, type:'text', question:question});
+      var group = radios.length ? radios : checks;
+      var sel = radios.length ? 'div[role="radio"]' : 'div[role="checkbox"]';
+      if (group.length) {
+        var boxes = group.map(function(r){ return optBox(r, el, sel); });
+        var labels = group.map(function(r, i){ return lab(r) || ('Pilihan ' + (i+1)); });
+        var oimgs = boxes.map(function(b){ return imgUrl(b); });
+        var o = {id:id, type: radios.length ? 'radio' : 'checkbox', question:question, options:labels, images:qImgs(el, boxes)};
+        if (oimgs.some(function(u){ return u; })) o.optionImages = oimgs;
+        out.push(o);
+      } else if (listbox) {
+        out.push({id:id, type:'dropdown', question:question,
+          options: all(listbox, 'div[role="option"]').map(lab).filter(Boolean), images:qImgs(el, [])});
+      } else if (text) {
+        var identitas = question.length < 60 && /(e-?mail|nama|sekolah|kelas|absen|nisn?)/i.test(question);
+        if (!identitas) out.push({id:id, type:'text', question:question, images:qImgs(el, [])});
+      }
     });
     return JSON.stringify(out);
   };
@@ -259,12 +373,14 @@ class MainActivity : Activity() {
   };
   var find = function(els, target){
     var t = norm(target);
+    var m = /^pilihan\s*(\d+)${'$'}/.exec(t);
+    if (m && els[parseInt(m[1], 10) - 1]) return els[parseInt(m[1], 10) - 1];
     for (var i=0;i<els.length;i++) if (norm(lab(els[i])) === t) return els[i];
     for (var j=0;j<els.length;j++){ var l = norm(lab(els[j])); if (l && (l.indexOf(t) >= 0 || t.indexOf(l) >= 0)) return els[j]; }
     return null;
   };
 
-  window.__fill = async function(str){
+  var runFill = async function(str){
     var answers = JSON.parse(str);
     var list = items();
     for (var k=0;k<answers.length;k++){
@@ -293,6 +409,9 @@ class MainActivity : Activity() {
       } catch(e) {}
       await sleep(120);
     }
+  };
+  window.__fill = function(str){
+    window.__q = (window.__q || Promise.resolve()).then(function(){ return runFill(str); });
   };
 })();
 """
